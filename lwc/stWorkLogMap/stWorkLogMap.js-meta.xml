@@ -13,7 +13,7 @@
     <targetConfigs>
         <targetConfig targets="lightning__RecordPage">
             <objects>
-                <object>Production_Work_Log__c</object>
+                <object>sitetracker__Production_Work_Log__c</object>
             </objects>
         </targetConfig>
 
