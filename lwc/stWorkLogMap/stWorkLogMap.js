@@ -1,7 +1,8 @@
 import { LightningElement, api } from 'lwc';
-import { loadScript } from 'lightning/platformResourceLoader';
+import { loadScript, loadStyle } from 'lightning/platformResourceLoader';
 import getMapInitData from '@salesforce/apex/StWorkLogMapController.getMapInitData';
 
+import MAPBOX_GL from '@salesforce/resourceUrl/mapboxgl';
 import MAP_BUNDLE_JS from '@salesforce/resourceUrl/sitetracker__MapBundleJs';
 import JQUERY_351 from '@salesforce/resourceUrl/sitetracker__Jquery351';
 
@@ -129,14 +130,7 @@ export default class StWorkLogMap extends LightningElement {
                 throw new Error(`Unsupported map provider: ${initData.mapProviderName}`);
             }
 
-            const mapboxScriptUrl = initData ? initData.mapProviderUrl : null;
-            const mapboxStyleUrl = this.buildMapboxStyleUrl(mapboxScriptUrl);
-
-            if (!mapboxScriptUrl) {
-                throw new Error('Mapbox script URL was not returned by Apex.');
-            }
-
-            await this.loadLibraries(mapboxScriptUrl, mapboxStyleUrl);
+            await this.loadLibraries();
 
             const accessToken = this.getMapboxAccessToken();
             if (!accessToken) {
@@ -150,21 +144,13 @@ export default class StWorkLogMap extends LightningElement {
         }
     }
 
-    async loadLibraries(mapboxScriptUrl, mapboxStyleUrl) {
+    async loadLibraries() {
         if (this.librariesLoaded) {
             return;
         }
 
-        // Best-effort CSS load. The map can still render even if the stylesheet is blocked.
-        if (mapboxStyleUrl) {
-            try {
-                await this.loadExternalStyle(mapboxStyleUrl);
-            } catch (e) {
-                // no-op
-            }
-        }
-
-        await this.loadExternalScript(mapboxScriptUrl);
+        await loadScript(this, `${MAPBOX_GL}/mapbox-gl.js`);
+        await loadStyle(this, `${MAPBOX_GL}/mapbox-gl.css`);
         await loadScript(this, JQUERY_351);
 
         const providerElementHandle = this.ensureGlobalMapProviderElement();
@@ -180,81 +166,6 @@ export default class StWorkLogMap extends LightningElement {
         }
 
         this.librariesLoaded = true;
-    }
-
-    async loadExternalScript(url) {
-        const stores = this.getExternalResourceStores();
-
-        if (stores.scripts[url]) {
-            return stores.scripts[url];
-        }
-
-        stores.scripts[url] = new Promise((resolve, reject) => {
-            const existing = document.querySelector(`script[src="${url}"]`);
-
-            if (existing) {
-                if (window.mapboxgl) {
-                    resolve();
-                    return;
-                }
-
-                existing.addEventListener('load', () => resolve(), { once: true });
-                existing.addEventListener(
-                    'error',
-                    () => reject(new Error(`Failed to load external script: ${url}`)),
-                    { once: true }
-                );
-                return;
-            }
-
-            const script = document.createElement('script');
-            script.src = url;
-            script.async = true;
-            script.onload = () => resolve();
-            script.onerror = () => reject(new Error(`Failed to load external script: ${url}`));
-
-            document.head.appendChild(script);
-        });
-
-        return stores.scripts[url];
-    }
-
-    async loadExternalStyle(url) {
-        const stores = this.getExternalResourceStores();
-
-        if (stores.styles[url]) {
-            return stores.styles[url];
-        }
-
-        stores.styles[url] = new Promise((resolve, reject) => {
-            const existing = document.querySelector(`link[href="${url}"]`);
-
-            if (existing) {
-                resolve();
-                return;
-            }
-
-            const link = document.createElement('link');
-            link.rel = 'stylesheet';
-            link.href = url;
-            link.onload = () => resolve();
-            link.onerror = () => reject(new Error(`Failed to load external stylesheet: ${url}`));
-
-            document.head.appendChild(link);
-        });
-
-        return stores.styles[url];
-    }
-
-    getExternalResourceStores() {
-        if (!window.__stWorkLogMapExternalResources) {
-            window.__stWorkLogMapExternalResources = {
-                scripts: {},
-                styles: {}
-            };
-        }
-
-        return window.__stWorkLogMapExternalResources;
     }
 
     ensureGlobalMapProviderElement() {
@@ -303,18 +214,6 @@ export default class StWorkLogMap extends LightningElement {
         }
 
         handle.element.setAttribute(GLOBAL_MAP_PROVIDER_ATTR, handle.previousValue);
-    }
-
-    buildMapboxStyleUrl(scriptUrl) {
-        if (!scriptUrl) {
-            return null;
-        }
-
-        if (scriptUrl.indexOf('mapbox-gl.js') === -1) {
-            return null;
-        }
-
-        return scriptUrl.replace('mapbox-gl.js', 'mapbox-gl.css');
     }
 
     getMapboxAccessToken() {
