@@ -1,12 +1,9 @@
 import { LightningElement, api } from 'lwc';
-import { loadScript, loadStyle } from 'lightning/platformResourceLoader';
+import { loadScript } from 'lightning/platformResourceLoader';
 import getMapInitData from '@salesforce/apex/StWorkLogMapController.getMapInitData';
 
-// If these static resources are namespaced in your org, update the imports accordingly.
-// Example: @salesforce/resourceUrl/sitetracker__MapBundleJs
-import MAPBOX_GL from '@salesforce/resourceUrl/mapboxgl';
-import MAP_BUNDLE_JS from '@salesforce/resourceUrl/MapBundleJs';
-import JQUERY_351 from '@salesforce/resourceUrl/Jquery351';
+import MAP_BUNDLE_JS from '@salesforce/resourceUrl/sitetracker__MapBundleJs';
+import JQUERY_351 from '@salesforce/resourceUrl/sitetracker__Jquery351';
 
 const DEFAULT_CENTER = [-74.0060, 40.7128];
 const DEFAULT_ZOOM = 9;
@@ -16,6 +13,9 @@ const NO_DATA_FOUND_MESSAGE = 'No data found.';
 const FAILED_TO_INITIALIZE_MESSAGE = 'Failed to initialize map.';
 const SITE_DISPLAY_ERROR_MESSAGE = 'There was a problem displaying this map.';
 
+const GLOBAL_MAP_PROVIDER_ELEMENT_ID = 'DataMapProviderName';
+const GLOBAL_MAP_PROVIDER_ATTR = 'data-map-provider-name';
+
 export default class StWorkLogMap extends LightningElement {
     @api recordId;
     @api workLogId;
@@ -23,8 +23,8 @@ export default class StWorkLogMap extends LightningElement {
     errorMessage = '';
     mapVisible = false;
 
-    resourcesLoaded = false;
-    initializing = false;
+    hasInitialized = false;
+    librariesLoaded = false;
     featuresLoaded = false;
 
     geoData = {};
@@ -34,12 +34,12 @@ export default class StWorkLogMap extends LightningElement {
     windowResizeHandler = null;
 
     renderedCallback() {
-        if (this.initializing) {
+        if (this.hasInitialized) {
             return;
         }
 
-        this.initializing = true;
-        this.initialize();
+        this.hasInitialized = true;
+        void this.initialize();
     }
 
     disconnectedCallback() {
@@ -94,7 +94,7 @@ export default class StWorkLogMap extends LightningElement {
     }
 
     get mapContainerClass() {
-        return 'map-canvas' + (this.mapVisible && !this.errorMessage ? ' visible' : '');
+        return `map-canvas${this.mapVisible && !this.errorMessage ? ' visible' : ''}`;
     }
 
     async initialize() {
@@ -107,7 +107,7 @@ export default class StWorkLogMap extends LightningElement {
             const initData = await getMapInitData({ workLogId: this.effectiveWorkLogId });
             this.geoData = this.safeParseJson(initData && initData.geoDataJson ? initData.geoDataJson : '{}');
 
-            if ((initData && initData.errorMessage) || this.geoData.error) {
+            if ((initData && initData.errorMessage) || (this.geoData && this.geoData.error)) {
                 this.showErrorMessage(
                     (initData && initData.errorMessage) ||
                     this.geoData.error ||
@@ -121,19 +121,22 @@ export default class StWorkLogMap extends LightningElement {
                 return;
             }
 
-            await this.loadLibraries();
-
-            if (!window.mapboxgl) {
-                throw new Error('Mapbox GL failed to load.');
-            }
-
             if (
                 initData &&
                 initData.mapProviderName &&
                 String(initData.mapProviderName).toLowerCase() !== 'mapbox'
             ) {
-                throw new Error('Unsupported map provider: ' + initData.mapProviderName);
+                throw new Error(`Unsupported map provider: ${initData.mapProviderName}`);
             }
+
+            const mapboxScriptUrl = initData ? initData.mapProviderUrl : null;
+            const mapboxStyleUrl = this.buildMapboxStyleUrl(mapboxScriptUrl);
+
+            if (!mapboxScriptUrl) {
+                throw new Error('Mapbox script URL was not returned by Apex.');
+            }
+
+            await this.loadLibraries(mapboxScriptUrl, mapboxStyleUrl);
 
             const accessToken = this.getMapboxAccessToken();
             if (!accessToken) {
@@ -147,17 +150,190 @@ export default class StWorkLogMap extends LightningElement {
         }
     }
 
-    async loadLibraries() {
-        if (this.resourcesLoaded) {
+    async loadLibraries(mapboxScriptUrl, mapboxStyleUrl) {
+        if (this.librariesLoaded) {
             return;
         }
 
-        await loadStyle(this, MAPBOX_GL + '/mapbox-gl.css');
-        await loadScript(this, MAPBOX_GL + '/mapbox-gl.js');
-        await loadScript(this, JQUERY_351);
-        await loadScript(this, MAP_BUNDLE_JS);
+        // Best-effort CSS load. The map can still render even if the stylesheet is blocked.
+        if (mapboxStyleUrl) {
+            try {
+                await this.loadExternalStyle(mapboxStyleUrl);
+            } catch (e) {
+                // no-op
+            }
+        }
 
-        this.resourcesLoaded = true;
+        await this.loadExternalScript(mapboxScriptUrl);
+        await loadScript(this, JQUERY_351);
+
+        const providerElementHandle = this.ensureGlobalMapProviderElement();
+
+        try {
+            await loadScript(this, MAP_BUNDLE_JS);
+        } finally {
+            this.restoreGlobalMapProviderElement(providerElementHandle);
+        }
+
+        if (!window.mapboxgl) {
+            throw new Error('Mapbox GL failed to load.');
+        }
+
+        this.librariesLoaded = true;
+    }
+
+    async loadExternalScript(url) {
+        const stores = this.getExternalResourceStores();
+
+        if (stores.scripts[url]) {
+            return stores.scripts[url];
+        }
+
+        stores.scripts[url] = new Promise((resolve, reject) => {
+            const existing = document.querySelector(`script[src="${url}"]`);
+
+            if (existing) {
+                if (window.mapboxgl) {
+                    resolve();
+                    return;
+                }
+
+                existing.addEventListener('load', () => resolve(), { once: true });
+                existing.addEventListener(
+                    'error',
+                    () => reject(new Error(`Failed to load external script: ${url}`)),
+                    { once: true }
+                );
+                return;
+            }
+
+            const script = document.createElement('script');
+            script.src = url;
+            script.async = true;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error(`Failed to load external script: ${url}`));
+
+            document.head.appendChild(script);
+        });
+
+        return stores.scripts[url];
+    }
+
+    async loadExternalStyle(url) {
+        const stores = this.getExternalResourceStores();
+
+        if (stores.styles[url]) {
+            return stores.styles[url];
+        }
+
+        stores.styles[url] = new Promise((resolve, reject) => {
+            const existing = document.querySelector(`link[href="${url}"]`);
+
+            if (existing) {
+                resolve();
+                return;
+            }
+
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = url;
+            link.onload = () => resolve();
+            link.onerror = () => reject(new Error(`Failed to load external stylesheet: ${url}`));
+
+            document.head.appendChild(link);
+        });
+
+        return stores.styles[url];
+    }
+
+    getExternalResourceStores() {
+        if (!window.__stWorkLogMapExternalResources) {
+            window.__stWorkLogMapExternalResources = {
+                scripts: {},
+                styles: {}
+            };
+        }
+
+        return window.__stWorkLogMapExternalResources;
+    }
+
+    ensureGlobalMapProviderElement() {
+        const existing = document.getElementById(GLOBAL_MAP_PROVIDER_ELEMENT_ID);
+
+        if (existing) {
+            const previousValue = existing.getAttribute(GLOBAL_MAP_PROVIDER_ATTR);
+            existing.setAttribute(GLOBAL_MAP_PROVIDER_ATTR, 'mapbox');
+
+            return {
+                element: existing,
+                created: false,
+                previousValue
+            };
+        }
+
+        const element = document.createElement('span');
+        element.id = GLOBAL_MAP_PROVIDER_ELEMENT_ID;
+        element.setAttribute(GLOBAL_MAP_PROVIDER_ATTR, 'mapbox');
+        element.style.display = 'none';
+
+        document.body.appendChild(element);
+
+        return {
+            element,
+            created: true,
+            previousValue: null
+        };
+    }
+
+    restoreGlobalMapProviderElement(handle) {
+        if (!handle || !handle.element) {
+            return;
+        }
+
+        if (handle.created) {
+            if (handle.element.parentNode) {
+                handle.element.parentNode.removeChild(handle.element);
+            }
+            return;
+        }
+
+        if (handle.previousValue === null || handle.previousValue === undefined) {
+            handle.element.removeAttribute(GLOBAL_MAP_PROVIDER_ATTR);
+            return;
+        }
+
+        handle.element.setAttribute(GLOBAL_MAP_PROVIDER_ATTR, handle.previousValue);
+    }
+
+    buildMapboxStyleUrl(scriptUrl) {
+        if (!scriptUrl) {
+            return null;
+        }
+
+        if (scriptUrl.indexOf('mapbox-gl.js') === -1) {
+            return null;
+        }
+
+        return scriptUrl.replace('mapbox-gl.js', 'mapbox-gl.css');
+    }
+
+    getMapboxAccessToken() {
+        if (window.mapboxgl && window.mapboxgl.accessToken) {
+            return window.mapboxgl.accessToken;
+        }
+
+        const ProviderCtor = window.MapboxProvider;
+        if (typeof ProviderCtor !== 'function') {
+            return null;
+        }
+
+        const provider = new ProviderCtor().getInstance();
+        if (!provider || typeof provider.getApi !== 'function') {
+            return null;
+        }
+
+        const api = provider.getApi();
+        return api && api.accessToken ? api.accessToken : null;
     }
 
     createMap() {
@@ -275,7 +451,7 @@ export default class StWorkLogMap extends LightningElement {
                 allCoordinates = allCoordinates.concat(coordinates);
 
                 const actualGeometry = this.determineGeometryType(coordinates);
-                const featureId = 'feature-' + i;
+                const featureId = `feature-${i}`;
 
                 if (actualGeometry === 'Polygon') {
                     this.addAreaPolygonWithId(coordinates, featureId);
@@ -314,7 +490,7 @@ export default class StWorkLogMap extends LightningElement {
                     properties: {},
                     geometry: {
                         type: 'LineString',
-                        coordinates: coordinates
+                        coordinates
                     }
                 }
             });
@@ -343,7 +519,7 @@ export default class StWorkLogMap extends LightningElement {
                     .addTo(this.mapInstance);
             }
         } catch (error) {
-            this.showErrorMessage('Error displaying segment: ' + error.message);
+            this.showErrorMessage(`Error displaying segment: ${error.message}`);
         }
     }
 
@@ -375,7 +551,7 @@ export default class StWorkLogMap extends LightningElement {
             });
 
             this.mapInstance.addLayer({
-                id: featureId + '-fill',
+                id: `${featureId}-fill`,
                 type: 'fill',
                 source: featureId,
                 paint: {
@@ -385,7 +561,7 @@ export default class StWorkLogMap extends LightningElement {
             });
 
             this.mapInstance.addLayer({
-                id: featureId + '-outline',
+                id: `${featureId}-outline`,
                 type: 'line',
                 source: featureId,
                 paint: {
@@ -394,7 +570,7 @@ export default class StWorkLogMap extends LightningElement {
                 }
             });
         } catch (error) {
-            this.showErrorMessage('Error displaying area: ' + error.message);
+            this.showErrorMessage(`Error displaying area: ${error.message}`);
         }
     }
 
@@ -594,32 +770,6 @@ export default class StWorkLogMap extends LightningElement {
         }
 
         return { center, zoom };
-    }
-
-    getMapboxAccessToken() {
-        if (typeof window.MapProviderService !== 'function') {
-            return null;
-        }
-
-        const providerService = new window.MapProviderService();
-
-        if (!providerService || typeof providerService.currentProvider !== 'function') {
-            return null;
-        }
-
-        const provider = providerService.currentProvider();
-
-        if (!provider || typeof provider.getApi !== 'function') {
-            return null;
-        }
-
-        const api = provider.getApi();
-
-        if (!api || !api.accessToken) {
-            return null;
-        }
-
-        return api.accessToken;
     }
 
     showErrorMessage(message) {
